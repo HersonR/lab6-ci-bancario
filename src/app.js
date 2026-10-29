@@ -16,6 +16,7 @@ function crearApp() {
   app.get('/health', (req, res) => res.json({ estado: 'ok' }));
   app.use('/api/v1/cuentas', rutasCuentas);
   app.use('/api/v1/transferencias', rutasTransferencias);
+  app.use('/api/v1/diagnostico', require('./routes/diagnostico'));
 
   app.use((req, res) => res.status(404).json({ error: 'RECURSO_NO_ENCONTRADO' }));
 
