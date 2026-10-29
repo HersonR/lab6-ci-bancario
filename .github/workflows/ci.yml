@@ -1,0 +1,377 @@
+# Pipeline de Integración Continua del microservicio de transferencias.
+#
+# Controles (NIST SP 800-218 SSDF y PCI-DSS v4.0 req. 6.3):
+#   Secretos (Gitleaks) .......... PCI-DSS 6.3 / 8.6, SSDF PO.5
+#   Build, lint y pruebas ........ SSDF PW.7, PW.8
+#   SAST (Semgrep, CodeQL) ....... SSDF PW.5 / PW.7, PCI-DSS 6.2.3 y 6.2.4
+#   SCA (npm audit, firmas, SBOM)  SSDF PW.4, PCI-DSS 6.3.2
+#   Quality Gate ................. bloquea la promoción de artefactos vulnerables
+#   Empaquetado y procedencia .... SSDF PS.2 / PS.3, trazabilidad e integridad
+#
+# Todas las actions de terceros están fijadas por SHA de commit (no por tag),
+# para que nadie pueda cambiar el código que se ejecuta sin cambiar este archivo.
+
+name: CI - Microservicio de Transferencias
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Mínimo privilegio: cada job pide solo los permisos adicionales que necesita.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '24'
+  RETENCION_DIAS: 90
+
+jobs:
+  secretos:
+    name: Secretos (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # todo el historial: un secreto borrado sigue expuesto en commits viejos
+          persist-credentials: false
+
+      - name: Instalar Gitleaks verificando su checksum
+        run: |
+          archivo="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archivo" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archivo}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archivo" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archivo" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Escanear el historial de git
+        run: |
+          mkdir -p reportes
+          "$RUNNER_TEMP/gitleaks" git . --redact --verbose \
+            --report-format sarif --report-path reportes/gitleaks.sarif
+
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reporte-secretos
+          path: reportes/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: ignore
+
+  build-pruebas:
+    name: Build, lint y pruebas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias exactas del lockfile
+        run: npm ci
+
+      - name: Lint con reglas de seguridad (0 advertencias permitidas)
+        run: npm run lint
+
+      - name: Pruebas unitarias con umbral de cobertura del 80 %
+        run: npm test
+
+      - name: Resumen de cobertura
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            jq -r '.total | "| Métrica | % |\n|---|---|\n| Líneas | \(.lines.pct) |\n| Sentencias | \(.statements.pct) |\n| Funciones | \(.functions.pct) |\n| Ramas | \(.branches.pct) |"' \
+              coverage/coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guardar reporte de cobertura
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reporte-cobertura
+          path: coverage/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: ignore
+
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # publicar hallazgos en la pestaña Security
+    env:
+      SEMGREP_VERSION: 1.182.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Analizar código fuente
+        run: |
+          mkdir -p reportes
+          semgrep scan \
+            --config p/javascript \
+            --config p/nodejsscan \
+            --config p/owasp-top-ten \
+            --metrics=off \
+            --json-output=reportes/semgrep.json \
+            --sarif-output=reportes/semgrep.sarif
+
+      - name: 'Quality Gate: 0 hallazgos de severidad ERROR'
+        run: |
+          # jq -e hace fallar el paso si el reporte no tiene el formato esperado (falla cerrada).
+          total=$(jq -e '.results | arrays | length' reportes/semgrep.json)
+          criticos=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' reportes/semgrep.json)
+          {
+            echo "### Semgrep"
+            echo "Hallazgos totales: **${total}** · severidad ERROR: **${criticos}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.results[] | "::\(if .extra.severity == "ERROR" then "error" else "warning" end) file=\(.path),line=\(.start.line)::\(.check_id)"' \
+            reportes/semgrep.json
+          if [ "$criticos" -gt 0 ]; then
+            echo "::error::Semgrep encontró ${criticos} hallazgo(s) críticos. El pipeline se detiene."
+            exit 1
+          fi
+
+      - name: Publicar en GitHub Code Scanning
+        if: always() && hashFiles('reportes/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: reportes/semgrep.sarif
+          category: semgrep
+
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reporte-sast-semgrep
+          path: reportes/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: ignore
+
+  sast-codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Analizar flujo de datos (taint analysis)
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: codeql
+          output: reportes
+
+      # CodeQL publica sus hallazgos pero no detiene el pipeline por sí solo:
+      # aquí se aplica el umbral (security-severity >= 7.0 equivale a High o Critical).
+      - name: 'Quality Gate: 0 hallazgos High/Critical'
+        run: |
+          criticos=0
+          for sarif in reportes/*.sarif; do
+            n=$(jq '[ .runs[]
+                     | ( [ (.tool.driver.rules // []), ((.tool.extensions // [])[] | (.rules // [])) ]
+                         | add
+                         | map({ key: .id, value: ((.properties["security-severity"] // "0") | tonumber) })
+                         | from_entries ) as $severidad
+                     | (.results // [])[]
+                     | select(($severidad[.ruleId // .rule.id // ""] // 0) >= 7.0) ] | length' "$sarif")
+            criticos=$((criticos + n))
+          done
+          {
+            echo "### CodeQL"
+            echo "Hallazgos High/Critical: **${criticos}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$criticos" -gt 0 ]; then
+            echo "::error::CodeQL encontró ${criticos} hallazgo(s) High/Critical. Revise la pestaña Security."
+            exit 1
+          fi
+
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reporte-sast-codeql
+          path: reportes/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: ignore
+
+  sca:
+    name: SCA (npm audit + SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias exactas del lockfile
+        run: npm ci
+
+      - name: Verificar firmas del registro npm (integridad de paquetes)
+        run: npm audit signatures
+
+      - name: Generar SBOM CycloneDX (dependencias de producción)
+        run: |
+          mkdir -p reportes
+          npm sbom --sbom-format cyclonedx --omit dev > reportes/sbom.cdx.json
+
+      - name: 'Quality Gate: 0 vulnerabilidades High/Critical'
+        run: |
+          npm audit --json > reportes/npm-audit.json || true
+          # jq -e hace fallar el paso si el reporte no trae conteos (falla cerrada).
+          criticos=$(jq -e '.metadata.vulnerabilities | .high + .critical' reportes/npm-audit.json)
+          jq -r '.metadata.vulnerabilities
+                 | "### npm audit\n| Severidad | Cantidad |\n|---|---|\n| Critical | \(.critical) |\n| High | \(.high) |\n| Moderate | \(.moderate) |\n| Low | \(.low) |"' \
+            reportes/npm-audit.json >> "$GITHUB_STEP_SUMMARY"
+          if [ "$criticos" -gt 0 ]; then
+            npm audit --audit-level=high || true
+            echo "::error::Hay ${criticos} dependencia(s) con vulnerabilidades High/Critical. El pipeline se detiene."
+            exit 1
+          fi
+
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reporte-sca
+          path: reportes/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: ignore
+
+  revision-dependencias:
+    name: Revisión de dependencias (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Compara las dependencias del PR contra main y bloquea si se introduce
+      # una dependencia con vulnerabilidad High o Critical.
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+  quality-gate:
+    name: Quality Gate
+    if: always()
+    needs: [secretos, build-pruebas, sast-semgrep, sast-codeql, sca, revision-dependencias]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Único check obligatorio en la protección de rama: resume todos los controles.
+      - name: Evaluar resultado de todos los controles
+        env:
+          RESULTADOS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "## Quality Gate"
+            echo "| Control | Resultado |"
+            echo "|---|---|"
+            echo "$RESULTADOS" | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # "skipped" solo se acepta para la revisión de dependencias (no corre en push).
+          fallidos=$(echo "$RESULTADOS" | jq -r '
+            to_entries[]
+            | select(.value.result != "success")
+            | select(.key != "revision-dependencias" or .value.result != "skipped")
+            | .key')
+          if [ -n "$fallidos" ]; then
+            echo "::error::Quality Gate NO superado. Controles fallidos: $(echo $fallidos)"
+            exit 1
+          fi
+          echo "Quality Gate superado: el artefacto puede promoverse."
+
+  empaquetado:
+    name: Empaquetado y procedencia
+    needs: quality-gate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # firma Sigstore sin llaves de larga duración
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Empaquetar el microservicio
+        run: |
+          mkdir -p dist
+          npm pack --pack-destination dist
+
+      - name: Calcular hashes y metadatos de trazabilidad
+        run: |
+          cd dist
+          sha256sum *.tgz > SHA256SUMS.txt
+          jq -n \
+            --arg repositorio "$GITHUB_REPOSITORY" \
+            --arg commit "$GITHUB_SHA" \
+            --arg rama "$GITHUB_REF_NAME" \
+            --arg ejecucion "$GITHUB_RUN_ID" \
+            --arg intento "$GITHUB_RUN_ATTEMPT" \
+            --arg autor "$GITHUB_ACTOR" \
+            --arg fecha "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{repositorio: $repositorio, commit: $commit, rama: $rama, ejecucion: $ejecucion, intento: $intento, autor: $autor, fecha: $fecha}' \
+            > build-info.json
+          cat SHA256SUMS.txt build-info.json
+          {
+            echo "### Artefacto"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Firmar procedencia del artefacto (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tgz
+
+      - name: Guardar artefacto aprobado
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ms-transferencias-${{ github.sha }}
+          path: dist/
+          retention-days: ${{ env.RETENCION_DIAS }}
+          if-no-files-found: error

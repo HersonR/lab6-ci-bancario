@@ -1,0 +1,13 @@
+# Actualizaciones automáticas de dependencias y de actions fijadas por SHA (SSDF PW.4).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
