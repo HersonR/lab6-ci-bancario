@@ -4,7 +4,8 @@
 #   Secretos (Gitleaks) .......... PCI-DSS 6.3 / 8.6, SSDF PO.5
 #   Build, lint y pruebas ........ SSDF PW.7, PW.8
 #   SAST (Semgrep, CodeQL) ....... SSDF PW.5 / PW.7, PCI-DSS 6.2.3 y 6.2.4
-#   SCA (npm audit, firmas, SBOM)  SSDF PW.4, PCI-DSS 6.3.2
+#   SCA (npm audit, firmas, SBOM,
+#        revisión de dependencias)  SSDF PW.4, PCI-DSS 6.3.2
 #   Quality Gate ................. bloquea la promoción de artefactos vulnerables
 #   Empaquetado y procedencia .... SSDF PS.2 / PS.3, trazabilidad e integridad
 #
@@ -266,6 +267,14 @@ jobs:
             exit 1
           fi
 
+      # Solo en PR: compara las dependencias contra main y bloquea si el cambio
+      # introduce una dependencia con vulnerabilidad High o Critical.
+      - name: Revisión de dependencias del PR
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
       - name: Guardar reportes
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -275,22 +284,10 @@ jobs:
           retention-days: ${{ env.RETENCION_DIAS }}
           if-no-files-found: ignore
 
-  revision-dependencias:
-    name: Revisión de dependencias (PR)
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      # Compara las dependencias del PR contra main y bloquea si se introduce
-      # una dependencia con vulnerabilidad High o Critical.
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          fail-on-severity: high
-
   quality-gate:
     name: Quality Gate
     if: always()
-    needs: [secretos, build-pruebas, sast-semgrep, sast-codeql, sca, revision-dependencias]
+    needs: [secretos, build-pruebas, sast-semgrep, sast-codeql, sca]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -305,12 +302,7 @@ jobs:
             echo "|---|---|"
             echo "$RESULTADOS" | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"'
           } >> "$GITHUB_STEP_SUMMARY"
-          # "skipped" solo se acepta para la revisión de dependencias (no corre en push).
-          fallidos=$(echo "$RESULTADOS" | jq -r '
-            to_entries[]
-            | select(.value.result != "success")
-            | select(.key != "revision-dependencias" or .value.result != "skipped")
-            | .key')
+          fallidos=$(echo "$RESULTADOS" | jq -r 'to_entries[] | select(.value.result != "success") | .key')
           if [ -n "$fallidos" ]; then
             echo "::error::Quality Gate NO superado. Controles fallidos: $(echo $fallidos)"
             exit 1
@@ -320,8 +312,7 @@ jobs:
   empaquetado:
     name: Empaquetado y procedencia
     needs: quality-gate
-    # Condición explícita: el "skipped" de la revisión de dependencias (solo corre en PR)
-    # se propagaría por la cadena de needs y saltaría este job aunque el gate haya pasado.
+    # Solo se promueve un artefacto si el Quality Gate pasó, y nunca desde un PR.
     if: >-
       !cancelled() &&
       needs.quality-gate.result == 'success' &&

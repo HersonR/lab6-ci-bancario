@@ -47,7 +47,7 @@ npm install lodash@4.17.15
 Resultado esperado:
 
 - **SCA** en rojo: `npm audit` clasifica `lodash` como High (prototype pollution e inyección de comandos, CVE-2021-23337).
-- **Revisión de dependencias (PR)** en rojo.
+- El paso *Revisión de dependencias del PR* (dentro de SCA) también lo detecta.
 - **Quality Gate** en rojo y el merge bloqueado.
 
 ## Capturas a tomar en cada PR

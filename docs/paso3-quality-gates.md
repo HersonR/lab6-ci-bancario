@@ -13,7 +13,7 @@ y la protección de rama impide el merge. Así **un artefacto vulnerable nunca s
 | 6 | SAST CodeQL | 0 hallazgos con security-severity ≥ 7.0 (High/Critical) | Paso *Quality Gate* del job `sast-codeql` |
 | 7 | SCA | 0 vulnerabilidades High o Critical en dependencias | Paso *Quality Gate* del job `sca` |
 | 8 | Integridad | Firmas del registro npm válidas | `npm audit signatures` |
-| 9 | Dependencias nuevas (PR) | 0 dependencias nuevas High o Critical | `revision-dependencias` |
+| 9 | Dependencias nuevas (PR) | 0 dependencias nuevas High o Critical | Paso *Revisión de dependencias del PR* del job `sca` |
 | 10 | Gate final | Todos los controles en *success* | Job `quality-gate` (check obligatorio en `main`) |
 
 ## Criterio de riesgo
