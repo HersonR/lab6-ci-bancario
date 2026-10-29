@@ -320,7 +320,13 @@ jobs:
   empaquetado:
     name: Empaquetado y procedencia
     needs: quality-gate
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Condición explícita: el "skipped" de la revisión de dependencias (solo corre en PR)
+    # se propagaría por la cadena de needs y saltaría este job aunque el gate haya pasado.
+    if: >-
+      !cancelled() &&
+      needs.quality-gate.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
